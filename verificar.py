@@ -45,7 +45,7 @@ PALAVRAS_DIARIO = (
     "publicação",
     "publicacao",
 )
-MACAPA_SITEMAP_URL = "https://macapa.ap.gov.br/official_diaries-sitemap3.xml"
+MACAPA_SITEMAP_INDEX_URL = "https://macapa.ap.gov.br/sitemap_index.xml"
 
 
 def carregar_jsonl(caminho: Path) -> tuple[list[dict], list[str]]:
@@ -202,7 +202,11 @@ def verificar_duplicatas(registros: list[dict]) -> list[str]:
     return erros
 
 
-def verificar_completude_local(registros: list[dict]) -> list[str]:
+def verificar_completude_local(
+    registros: list[dict],
+    inicio: date | None,
+    fim: date | None,
+) -> list[str]:
     erros: list[str] = []
     por_fonte: dict[str, list[dict]] = defaultdict(list)
     for reg in registros:
@@ -229,12 +233,21 @@ def verificar_completude_local(registros: list[dict]) -> list[str]:
                     f"edições ausentes = {faltando}"
                 )
 
-        # 2. Intervalos de dias corridos entre publicações consecutivas (> 6 dias indica possível lacuna)
+        # 2. Intervalos de dias corridos entre publicações e bordas do período (> 6 dias indica lacuna)
         datas = sorted({date.fromisoformat(r["data_publicacao"]) for r in itens if r.get("data_publicacao")})
-        for d1, d2 in zip(datas, datas[1:]):
-            gap = (d2 - d1).days
-            if gap > 6:
-                erros.append(f"[{fonte}] Lacuna incomum de {gap} dias sem edição entre {d1} e {d2}")
+        if datas:
+            if inicio and (datas[0] - inicio).days > 6:
+                erros.append(
+                    f"[{fonte}] Lacuna no início do período: pedido {inicio}, primeira edição só em {datas[0]}"
+                )
+            if fim and (fim - datas[-1]).days > 6:
+                erros.append(
+                    f"[{fonte}] Lacuna no fim do período: pedido até {fim}, última edição em {datas[-1]}"
+                )
+            for d1, d2 in zip(datas, datas[1:]):
+                gap = (d2 - d1).days
+                if gap > 6:
+                    erros.append(f"[{fonte}] Lacuna incomum de {gap} dias sem edição entre {d1} e {d2}")
 
     return erros
 
@@ -246,30 +259,49 @@ def verificar_contra_fontes(registros: list[dict], inicio: date, fim: date) -> l
         (r["fonte"], r["data_publicacao"], r["numero_edicao"], r["tipo"]) for r in registros
     }
 
-    # 1. Macapá — prova independente via Yoast XML Sitemap
+    # 1. Macapá — prova independente via Yoast XML Sitemap (descoberto pelo índice)
     print("[checar-fonte] Consultando sitemap independente de Macapá...")
-    resp = requests.get(MACAPA_SITEMAP_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
-    resp.raise_for_status()
-    root = ET.fromstring(resp.content)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    sitemap_macapa = set()
-    for loc in root.findall(".//sm:loc", ns):
-        url = (loc.text or "").strip()
-        m = re.search(r"/diarios-oficiais/(\d+(?:-[a-z])?)-(\d{2})-(\d{2})-(\d{4})/?$", url, re.IGNORECASE)
-        if not m:
-            continue
-        num_raw, dd, mm, yyyy = m.groups()
-        data_pub = date(int(yyyy), int(mm), int(dd))
-        if inicio <= data_pub <= fim:
-            num = num_raw.upper()
-            tipo = "extra" if re.search(r"-[A-Z]$", num) else "normal"
-            sitemap_macapa.add(("macapa", data_pub.isoformat(), num, tipo))
+    idx_resp = requests.get(MACAPA_SITEMAP_INDEX_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
+    idx_resp.raise_for_status()
+    idx_root = ET.fromstring(idx_resp.content)
 
-    faltando_mcp = sorted(sitemap_macapa - chaves_locais)
+    sitemaps_macapa = []
+    for sm in idx_root.findall(".//sm:sitemap", ns):
+        loc = (sm.findtext("sm:loc", default="", namespaces=ns) or "").strip()
+        lastmod = (sm.findtext("sm:lastmod", default="", namespaces=ns) or "")[:10]
+        if "official_diaries-sitemap" not in loc:
+            continue
+        if lastmod and date.fromisoformat(lastmod) < inicio:
+            continue
+        sitemaps_macapa.append(loc)
+
+    sitemap_macapa = set()
+    for sm_url in sitemaps_macapa:
+        resp = requests.get(sm_url, headers={"User-Agent": USER_AGENT}, timeout=30)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        for loc in root.findall(".//sm:loc", ns):
+            url = (loc.text or "").strip()
+            m = re.search(r"/diarios-oficiais/(\d+(?:-[a-z])?)-(\d{2})-(\d{2})-(\d{4})/?$", url, re.IGNORECASE)
+            if not m:
+                continue
+            num_raw, dd, mm, yyyy = m.groups()
+            data_pub = date(int(yyyy), int(mm), int(dd))
+            if inicio <= data_pub <= fim:
+                num = num_raw.upper()
+                tipo = "extra" if re.search(r"-[A-Z]$", num) else "normal"
+                sitemap_macapa.add(("macapa", data_pub.isoformat(), num, tipo))
+
+    locais_mcp = {c for c in chaves_locais if c[0] == "macapa"}
+    faltando_mcp = sorted(sitemap_macapa - locais_mcp)
+    extras_mcp = sorted(locais_mcp - sitemap_macapa)
     if faltando_mcp:
         erros.append(f"[macapa] Edições no sitemap ausentes no JSONL: {faltando_mcp}")
-    else:
-        print(f"  [macapa] OK — todas as {len(sitemap_macapa)} edições do sitemap estão no JSONL.")
+    if extras_mcp:
+        erros.append(f"[macapa] Edições no JSONL ausentes no sitemap: {extras_mcp}")
+    if not faltando_mcp and not extras_mcp:
+        print(f"  [macapa] OK — todas as {len(sitemap_macapa)} edições do sitemap batem 100% com o JSONL.")
 
     # 2. Fortaleza — reconciliação com /api/search
     print("[checar-fonte] Consultando API oficial de Fortaleza...")
@@ -278,11 +310,15 @@ def verificar_contra_fontes(registros: list[dict], inicio: date, fim: date) -> l
     esperadas_fort = {
         ("fortaleza", e["data_publicacao"], e["numero_edicao"], e["tipo"]) for e in fort_api
     }
-    faltando_fort = sorted(esperadas_fort - chaves_locais)
+    locais_fort = {c for c in chaves_locais if c[0] == "fortaleza"}
+    faltando_fort = sorted(esperadas_fort - locais_fort)
+    extras_fort = sorted(locais_fort - esperadas_fort)
     if faltando_fort:
         erros.append(f"[fortaleza] Edições na API ausentes no JSONL: {faltando_fort}")
-    else:
-        print(f"  [fortaleza] OK — todas as {len(esperadas_fort)} edições únicas da API estão no JSONL.")
+    if extras_fort:
+        erros.append(f"[fortaleza] Edições no JSONL ausentes na API: {extras_fort}")
+    if not faltando_fort and not extras_fort:
+        print(f"  [fortaleza] OK — todas as {len(esperadas_fort)} edições únicas da API batem 100% com o JSONL.")
 
     return erros
 
@@ -334,7 +370,7 @@ def main() -> None:
         erros_q, avisos = verificar_esquema_e_qualidade(registros, inicio, fim)
         erros.extend(erros_q)
         erros.extend(verificar_duplicatas(registros))
-        erros.extend(verificar_completude_local(registros))
+        erros.extend(verificar_completude_local(registros, inicio, fim))
         if args.checar_fonte:
             if not (inicio and fim):
                 datas = [date.fromisoformat(r["data_publicacao"]) for r in registros if r.get("data_publicacao")]

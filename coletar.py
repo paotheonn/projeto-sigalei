@@ -51,19 +51,26 @@ def criar_sessao() -> requests.Session:
 
 
 def requisitar_com_retry(sessao: requests.Session, metodo: str, url: str, tentativas: int = 3, **kwargs) -> requests.Response:
-    """Faz requisição HTTP com backoff simples para falhas transitórias."""
+    """Faz requisição HTTP com backoff simples para falhas transitórias (rede, 429, 5xx)."""
+    timeout = kwargs.pop("timeout", 45)
     ultimo_erro = None
     for tentativa in range(1, tentativas + 1):
         try:
-            resp = sessao.request(metodo, url, timeout=kwargs.pop("timeout", 45), **kwargs)
+            resp = sessao.request(metodo, url, timeout=timeout, **kwargs)
             resp.raise_for_status()
             return resp
+        except requests.HTTPError as err:
+            status = err.response.status_code if err.response is not None else 0
+            if status != 429 and status < 500:
+                raise
+            ultimo_erro = err
         except requests.RequestException as err:
             ultimo_erro = err
-            if tentativa < tentativas:
-                espera = 2 * tentativa
-                print(f"  [retry {tentativa}/{tentativas}] erro em {url}: {err} (aguardando {espera}s)", file=sys.stderr)
-                time.sleep(espera)
+
+        if tentativa < tentativas:
+            espera = 2 * tentativa
+            print(f"  [retry {tentativa}/{tentativas}] erro em {url}: {ultimo_erro} (aguardando {espera}s)", file=sys.stderr)
+            time.sleep(espera)
     raise ultimo_erro
 
 
@@ -210,7 +217,7 @@ def listar_macapa(sessao: requests.Session, inicio: date, fim: date, pausa: floa
         if ano != ano_atual:
             snapshot_obj = chamar_livewire("changeYear", [str(ano)])
             ano_atual = ano
-            mes_atual = int(snapshot_obj["data"]["month"])
+            mes_atual = int(snapshot_obj["data"]["month"] or 0)
         if mes != mes_atual:
             snapshot_obj = chamar_livewire("setMonth", [f"{mes:02d}"])
             mes_atual = mes

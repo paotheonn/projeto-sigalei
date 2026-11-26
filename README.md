@@ -2,8 +2,8 @@
 
 Coletor e verificador dos últimos 60 dias dos diários oficiais municipais de **Macapá (AP)** e **Fortaleza (CE)**.
 
-* **Intervalo coletado:** `2026-09-26` a `2026-11-25` (60 dias a partir de 25/11/2026; 26–27/09 foram fim de semana).
-* **Resultado:** 77 edições únicas em `dados/diarios.jsonl` (16,3 MB) — 38 de Fortaleza (`18406`..`18443`, 28/09 a 24/11) e 39 de Macapá (`5383`..`5421`, 28/09 a 25/11).
+* **Intervalo coletado:** `2026-09-26` a `2026-11-25` (60 dias contados a partir de 25/11/2026; 26–27/09 foram fim de semana).
+* **Resultado:** 78 edições únicas em `dados/diarios.jsonl` (16,7 MB) — 39 de Fortaleza (`18406`..`18444`, 28/09 a 25/11) e 39 de Macapá (`5383`..`5421`, 28/09 a 25/11).
 * **Formato (JSONL):** uma edição por linha usando só a stdlib `json`, sem banco externo, sem problemas de escape com quebras de linha no texto completo e fácil de inspecionar em streaming.
 
 ## Como rodar
@@ -29,9 +29,9 @@ python verificar.py dados/diarios.jsonl --inicio 2026-09-26 --fim 2026-11-25 --c
 
 ## Como sei que não faltou nenhuma edição
 
-1. **Numeração sequencial sem furos:** Fortaleza `18406`..`18443` e Macapá `5383`..`5421` (sequencialidade declarada no expediente do DOM).
-2. **Reconciliação cruzada (`--checar-fonte`):** o verificador cruza o JSONL com o sitemap XML de Macapá (`official_diaries-sitemap3.xml`) e com a busca paginada de Fortaleza — 100% batem.
-3. **Calendário:** todas as pausas coincidem com fins de semana e feriados (12/10, 30/10, 02/11, 20/11); Fortaleza costuma subir à noite, por isso `25/11` ainda não constava na coleta.
+1. **Numeração sequencial sem furos:** Fortaleza `18406`..`18444` e Macapá `5383`..`5421` (sequencialidade declarada no expediente do DOM).
+2. **Reconciliação cruzada (`--checar-fonte`):** o verificador cruza o JSONL com o sitemap XML de Macapá (descoberto via `sitemap_index.xml`) e com a busca paginada de Fortaleza — 100% batem.
+3. **Calendário:** todas as pausas (incluindo bordas do período) coincidem com fins de semana e feriados (12/10, 30/10, 02/11, 20/11).
 
 ## Limites, riscos e uso de IA
 
