@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.pdf
+*.tmp
+.DS_Store
+desafio.md
