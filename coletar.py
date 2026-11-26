@@ -53,7 +53,6 @@ def criar_sessao() -> requests.Session:
 def requisitar_com_retry(sessao: requests.Session, metodo: str, url: str, tentativas: int = 3, **kwargs) -> requests.Response:
     """Faz requisição HTTP com backoff simples para falhas transitórias (rede, 429, 5xx)."""
     timeout = kwargs.pop("timeout", 45)
-    ultimo_erro = None
     for tentativa in range(1, tentativas + 1):
         try:
             resp = sessao.request(metodo, url, timeout=timeout, **kwargs)
@@ -61,17 +60,18 @@ def requisitar_com_retry(sessao: requests.Session, metodo: str, url: str, tentat
             return resp
         except requests.HTTPError as err:
             status = err.response.status_code if err.response is not None else 0
-            if status != 429 and status < 500:
+            if (status != 429 and status < 500) or tentativa == tentativas:
                 raise
-            ultimo_erro = err
+            erro_atual: requests.RequestException = err
         except requests.RequestException as err:
-            ultimo_erro = err
+            if tentativa == tentativas:
+                raise
+            erro_atual = err
 
-        if tentativa < tentativas:
-            espera = 2 * tentativa
-            print(f"  [retry {tentativa}/{tentativas}] erro em {url}: {ultimo_erro} (aguardando {espera}s)", file=sys.stderr)
-            time.sleep(espera)
-    raise ultimo_erro
+        espera = 2 * tentativa
+        print(f"  [retry {tentativa}/{tentativas}] erro em {url}: {erro_atual} (aguardando {espera}s)", file=sys.stderr)
+        time.sleep(espera)
+    raise RuntimeError(f"Número inválido de tentativas ({tentativas}) para {url}")
 
 
 def meses_no_intervalo(inicio: date, fim: date, incluir_mes_seguinte: bool = True) -> list[tuple[int, int]]:
