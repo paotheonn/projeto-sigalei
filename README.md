@@ -17,7 +17,8 @@ python -m venv .venv
 .venv\Scripts\activate          # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 
-# 1. Coletar (usa Document AI se GOOGLE_APPLICATION_CREDENTIALS + DOCAI_PROCESSOR estiverem definidos; senão Tesseract)
+# 1. Coletar (sem credenciais GCP usa Tesseract local automaticamente;
+#    para Document AI + resgate Gemini 3.8 Flash, defina GOOGLE_APPLICATION_CREDENTIALS e DOCAI_PROCESSOR)
 python coletar.py --inicio 2026-09-28 --fim 2026-11-27 --saida dados/diarios.db --retomar
 
 # 2. Verificar completude, FTS5 e qualidade página a página (exit code 1 se falhar)
@@ -42,7 +43,7 @@ Em Macapá, 36 das 40 edições são PDFs escaneados em **2 colunas** (`ABBYY Fi
 | **Google Document AI + `boundingPoly`** | **56/57 (98,2%)** | **100% (coords)** | Zero omissão/alucinação, confiança por página (`96–98%`), 5/5 decretos e 100% CNJs | **~US\$ 0,06** *(1k grátis; US\$ 1,50/1k)* |
 | **Gemini 3.8 Flash / 4 Hydrogen (`LOW`)** | **57/57 (100%)** | Nativo | Qualidade máxima, mas 5–16x mais caro que Document AI | ~US\$ 7 / US\$ 25 |
 
-**Decisão:** **Google Document AI** com reconstrução determinística das 2 colunas via `boundingPoly` + **resgate automático com Gemini 3.8 Flash** nas páginas com confiança `< 0,85` ou texto curto (resgatou a pág. 40 da edição `5390` de 132 para 1.518 chars) + **fallback local Tesseract** sem conta GCP. Eliminou os 7 erros de leitura de capa que o Tesseract tinha em Macapá.
+**Decisão (cascata de custo mínimo):** camada nativa (validando integridade de fonte/CMap) → **Google Document AI** com reconstrução de 2 colunas via `boundingPoly` → **resgate Gemini 3.8 Flash** guiado por **média + percentil 10 (`p10`)**: recorte cirúrgico (`crop`, ~6x mais barato) nas linhas isoladas `< 0,78` e página inteira apenas se média `< 0,85`, `p10 < 0,80` ou texto curto (resgatou a pág. 40 da edição `5390` de 132 para 1.518 chars), com **fallback local Tesseract** sem GCP. Eliminou os 7 erros de leitura de capa que o Tesseract tinha em Macapá.
 
 ## Fontes, limpeza e prova de completude
 

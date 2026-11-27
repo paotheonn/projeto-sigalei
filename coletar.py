@@ -40,6 +40,9 @@ FORTALEZA_BASE = "https://diariooficial.fortaleza.ce.gov.br"
 DOCAI_LOTE_PAGINAS = 5
 DOCAI_WORKERS = 4
 LIMIAR_CONFIANCA_RESGATE = 0.85
+LIMIAR_CONFIANCA_P10 = 0.80
+LIMIAR_CONFIANCA_LINHA = 0.78
+MAX_RECORTES_POR_PAGINA = 3
 MIN_ALFANUM_PAGINA_NATIVA = 50
 
 SIGLAS_HIFEN_PRESERVAR = {
@@ -155,8 +158,40 @@ def limpar_texto_pagina(texto: str) -> str:
     return texto.strip()
 
 
+PROMPT_RESGATE_RECORTE = (
+    "Transcreva exatamente o texto impresso neste pequeno recorte de Diário Oficial brasileiro. "
+    "Preserve acentos, nomes próprios, algarismos romanos, números e símbolos (§, º, ª). "
+    "Se houver apenas rabisco de assinatura manuscrita sem texto impresso, retorne exatamente: VAZIO. "
+    "Retorne APENAS o texto puro transcrito, sem blocos markdown e sem comentários."
+)
+
+
 def contar_alfanum(texto: str) -> int:
     return sum(ch.isalnum() for ch in texto)
+
+
+def pagina_nativa_valida(texto: str) -> bool:
+    """Confirma que a camada de texto nativo é real e não tem fonte/CMap corrompido."""
+    if contar_alfanum(texto) < MIN_ALFANUM_PAGINA_NATIVA:
+        return False
+    nao_espaco = re.sub(r"\s+", "", texto)
+    if not nao_espaco:
+        return False
+    if texto.count("\ufffd") / len(nao_espaco) > 0.005:
+        return False
+    # Caracteres na Área Privada Unicode (U+E000..U+F8FF) indicam tabela ToUnicode/CMap quebrada
+    qtd_pua = sum(0xE000 <= ord(ch) <= 0xF8FF for ch in nao_espaco)
+    if qtd_pua / len(nao_espaco) > 0.01:
+        return False
+    return (sum(ch.isalnum() for ch in nao_espaco) / len(nao_espaco)) >= 0.50
+
+
+def percentil(valores: list[float], q: float) -> float:
+    if not valores:
+        return 0.0
+    ordenados = sorted(valores)
+    idx = max(0, min(len(ordenados) - 1, int(q * (len(ordenados) - 1))))
+    return ordenados[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -236,10 +271,11 @@ def _ordenar_linhas_leitura(itens: list[dict]) -> list[str]:
     return linhas
 
 
-def reconstruir_pagina_docai(pagina_json: dict, texto_completo: str) -> tuple[str, float]:
-    """Reconstrói texto respeitando ordem de 2 colunas usando boundingPoly do Document AI."""
+def reconstruir_pagina_docai(pagina_json: dict, texto_completo: str) -> tuple[str, float, float, list[dict]]:
+    """Reconstrói texto em 2 colunas via boundingPoly e retorna (texto, conf_media, conf_p10, linhas_suspeitas)."""
     itens = []
-    confs = []
+    confs_linhas = []
+    linhas_suspeitas = []
     for ln in pagina_json.get("lines", []):
         lay = ln.get("layout", {})
         txt = _texto_ancora_docai(lay, texto_completo)
@@ -248,24 +284,34 @@ def reconstruir_pagina_docai(pagina_json: dict, texto_completo: str) -> tuple[st
         x0, x1, y0, y1 = _bbox_docai(lay)
         conf = lay.get("confidence")
         if isinstance(conf, (int, float)):
-            confs.append(conf)
+            confs_linhas.append(conf)
+            if conf < LIMIAR_CONFIANCA_LINHA and len(re.sub(r"[^A-Za-zÀ-ÿ0-9]", "", txt)) >= 2:
+                linhas_suspeitas.append({"text": txt, "conf": conf, "bbox": (x0, y0, x1, y1)})
         itens.append(
             {"text": txt, "x0": x0, "x1": x1, "y0": y0, "y1": y1, "xc": (x0 + x1) / 2.0, "yc": (y0 + y1) / 2.0}
         )
 
-    # Confiança média a partir dos tokens (mais granular); fallback para linhas
-    tok_confs = [
-        tok.get("layout", {}).get("confidence")
-        for tok in pagina_json.get("tokens", [])
-        if isinstance(tok.get("layout", {}).get("confidence"), (int, float))
-    ]
+    # Confiança média e percentil 10 (inspirado no low_grade do Docling) sobre tokens alfanuméricos >= 2 chars
+    tok_confs = []
+    tok_alnum_confs = []
+    for tok in pagina_json.get("tokens", []):
+        lay = tok.get("layout", {})
+        c = lay.get("confidence")
+        if not isinstance(c, (int, float)):
+            continue
+        tok_confs.append(c)
+        t_txt = _texto_ancora_docai(lay, texto_completo)
+        if len(re.sub(r"[^A-Za-zÀ-ÿ0-9]", "", t_txt)) >= 2:
+            tok_alnum_confs.append(c)
+
     conf_media = (
         sum(tok_confs) / len(tok_confs)
         if tok_confs
-        else (sum(confs) / len(confs) if confs else 0.0)
+        else (sum(confs_linhas) / len(confs_linhas) if confs_linhas else 0.0)
     )
+    conf_p10 = percentil(tok_alnum_confs or tok_confs or confs_linhas, 0.10)
     if not itens:
-        return "", conf_media
+        return "", conf_media, conf_p10, []
 
     # Cabeçalho superior fino (ex.: "Macapá, 25.11.2026 DIÁRIO DO MUNICÍPIO pág. 05")
     topo = [it for it in itens if it["yc"] < 0.055]
@@ -281,7 +327,7 @@ def reconstruir_pagina_docai(pagina_json: dict, texto_completo: str) -> tuple[st
         and len(largas) <= max(6, int(len(corpo) * 0.25))
     )
     if not eh_duas_colunas:
-        return limpar_texto_pagina("\n".join(_ordenar_linhas_leitura(itens))), conf_media
+        return limpar_texto_pagina("\n".join(_ordenar_linhas_leitura(itens))), conf_media, conf_p10, linhas_suspeitas
 
     faixas: list[tuple[str, list[dict], list[dict]]] = []
     col_esq: list[dict] = []
@@ -307,7 +353,7 @@ def reconstruir_pagina_docai(pagina_json: dict, texto_completo: str) -> tuple[st
         if tipo_faixa == "cols":
             linhas_finais.extend(_ordenar_linhas_leitura(b))
 
-    return limpar_texto_pagina("\n".join(linhas_finais)), conf_media
+    return limpar_texto_pagina("\n".join(linhas_finais)), conf_media, conf_p10, linhas_suspeitas
 
 
 def _preparar_lotes_pdf(doc: pymupdf.Document, indices_paginas: list[int], max_pags: int) -> list[tuple[list[int], bytes]]:
@@ -336,7 +382,7 @@ def ocr_lote_docai(
     indices_paginas: list[int],
     creds,
     processor_name: str,
-) -> dict[int, tuple[str, float]]:
+) -> dict[int, tuple[str, float, float, list[dict]]]:
     """Envia lotes de páginas escaneadas para o Document AI (até 4 lotes em paralelo na API do Google)."""
     m_loc = re.search(r"/locations/([^/]+)/", processor_name)
     loc = m_loc.group(1) if m_loc else "us"
@@ -346,7 +392,7 @@ def ocr_lote_docai(
     # Garante token válido antes de abrir as threads
     token = obter_token_gcp(creds)
 
-    def processar_um(item: tuple[list[int], bytes]) -> dict[int, tuple[str, float]]:
+    def processar_um(item: tuple[list[int], bytes]) -> dict[int, tuple[str, float, float, list[dict]]]:
         lote, pdf_lote = item
         sess_local = criar_sessao()
         resp = requisitar_com_retry(
@@ -372,12 +418,59 @@ def ocr_lote_docai(
             )
         return {idx_pdf: reconstruir_pagina_docai(pg_json, texto_full) for idx_pdf, pg_json in zip(lote, paginas_json)}
 
-    resultados: dict[int, tuple[str, float]] = {}
+    resultados: dict[int, tuple[str, float, float, list[dict]]] = {}
     workers = max(1, min(DOCAI_WORKERS, len(lotes)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         for parcial in pool.map(processar_um, lotes):
             resultados.update(parcial)
     return resultados
+
+
+def resgate_recorte_gemini(
+    sessao: requests.Session,
+    pagina: pymupdf.Page,
+    bbox_norm: tuple[float, float, float, float],
+    creds,
+    project_id: str,
+) -> str:
+    """Reprocessa apenas o recorte (crop) de uma linha de baixa confiança no Gemini 3.8 Flash (~6x mais barato)."""
+    x0, y0, x1, y1 = bbox_norm
+    rect = pagina.rect
+    clip = pymupdf.Rect(
+        max(0.0, (x0 - 0.010) * rect.width),
+        max(0.0, (y0 - 0.002) * rect.height),
+        min(rect.width, (x1 + 0.010) * rect.width),
+        min(rect.height, (y1 + 0.002) * rect.height),
+    )
+    png = pagina.get_pixmap(dpi=250, clip=clip, colorspace=pymupdf.csGRAY).tobytes("png")
+    token = obter_token_gcp(creds)
+    url = (
+        f"https://aiplatform.googleapis.com/v1/projects/{project_id}"
+        "/locations/global/publishers/google/models/gemini-3.8-flash:generateContent"
+    )
+    resp = requisitar_com_retry(
+        sessao,
+        "POST",
+        url,
+        tentativas=3,
+        timeout=60,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": PROMPT_RESGATE_RECORTE},
+                        {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(png).decode("ascii")}},
+                    ],
+                }
+            ],
+            "generationConfig": {"temperature": 0.0, "thinkingConfig": {"thinkingLevel": "LOW"}},
+        },
+    )
+    parts = resp.json()["candidates"][0]["content"].get("parts", [])
+    txt = " ".join(p.get("text", "").strip() for p in parts if not p.get("thought") and "text" in p).strip()
+    return limpar_texto_pagina(txt)
 
 
 def resgate_pagina_gemini(
@@ -483,7 +576,7 @@ def extrair_paginas_pdf(
         total_paginas = len(doc)
         for idx in range(total_paginas):
             texto_nativo = limpar_texto_pagina(doc[idx].get_text("text"))
-            if contar_alfanum(texto_nativo) >= MIN_ALFANUM_PAGINA_NATIVA:
+            if pagina_nativa_valida(texto_nativo):
                 paginas_saida.append(
                     {
                         "numero_pagina": idx + 1,
@@ -515,19 +608,20 @@ def extrair_paginas_pdf(
                     )
                 lote_res = ocr_lote_docai(sessao, doc, indices_ocr, creds_gcp, processor_name)
                 for idx in indices_ocr:
-                    txt_ocr, conf = lote_res[idx]
+                    txt_ocr, conf, conf_p10, linhas_susp = lote_res[idx]
                     metodo_pag = "document_ai"
-                    # Resgate automático com Gemini 3.8 Flash se a confiança ficar baixa ou texto muito curto
-                    if (
-                        resgate_gemini
-                        and project_id
-                        and (conf < LIMIAR_CONFIANCA_RESGATE or contar_alfanum(txt_ocr) < 80)
-                    ):
+                    # Cascata de resgate: página inteira se média/p10/tamanho caírem; senão recorte cirúrgico nas linhas < 0.78
+                    precisa_pagina_inteira = (
+                        conf < LIMIAR_CONFIANCA_RESGATE
+                        or conf_p10 < LIMIAR_CONFIANCA_P10
+                        or contar_alfanum(txt_ocr) < 80
+                    )
+                    if resgate_gemini and project_id and precisa_pagina_inteira:
                         try:
                             txt_gem = resgate_pagina_gemini(sessao, doc[idx], creds_gcp, project_id)
                             if contar_alfanum(txt_gem) >= contar_alfanum(txt_ocr) * 0.85 and contar_alfanum(txt_gem) >= 40:
                                 print(
-                                    f"    [resgate gemini] pág {idx + 1}: conf DocAI={conf:.2f} "
+                                    f"    [resgate gemini pagina] pág {idx + 1}: mean={conf:.2f} p10={conf_p10:.2f} "
                                     f"({len(txt_ocr)} -> {len(txt_gem)} chars)"
                                 )
                                 txt_ocr = txt_gem
@@ -535,6 +629,19 @@ def extrair_paginas_pdf(
                                 conf = None
                         except Exception as err:
                             print(f"    [aviso resgate gemini] pág {idx + 1}: {err}", file=sys.stderr)
+                    elif resgate_gemini and project_id and linhas_susp:
+                        # Recorte cirúrgico apenas nas linhas de baixa confiança (~6x mais barato que página inteira)
+                        for susp in sorted(linhas_susp, key=lambda x: x["conf"])[:MAX_RECORTES_POR_PAGINA]:
+                            try:
+                                novo = resgate_recorte_gemini(sessao, doc[idx], susp["bbox"], creds_gcp, project_id)
+                                antigo = susp["text"]
+                                if novo.upper() == "VAZIO":
+                                    txt_ocr = txt_ocr.replace(antigo, "").strip()
+                                elif novo and novo != antigo and novo not in txt_ocr:
+                                    txt_ocr = txt_ocr.replace(antigo, novo, 1)
+                            except Exception as err:
+                                print(f"    [aviso recorte gemini] pág {idx + 1}: {err}", file=sys.stderr)
+                        txt_ocr = limpar_texto_pagina(txt_ocr)
 
                     paginas_saida[idx]["texto"] = txt_ocr
                     paginas_saida[idx]["metodo_extracao"] = metodo_pag
