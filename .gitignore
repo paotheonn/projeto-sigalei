@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 *.pdf
 *.tmp
+*.db-wal
+*.db-shm
+.env
 .DS_Store
 desafio.md
 preparo-entrevista.md
+explicacao-codigo.md
+auditoria-outras-ias.md
